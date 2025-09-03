@@ -1,4 +1,4 @@
-#define firmware_version 1.5
+#define firmware_version 1.6
 
 #include <WiFiManager.h>  
 #include <EEPROM.h>
@@ -138,8 +138,7 @@ void handleStream()
             delay(1000);
           } 
         }
-        String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + swNumber;
-        Firebase.setInt(fbdo, basePath, 3);
+
         system_status = Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
       }
       if (dataPath.startsWith("/UPDATE")) 
@@ -309,6 +308,8 @@ void applySchedules()
       {
         serial_out(i,1);
         on_transfer_counter[i]++;
+        String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + i;
+        Firebase.setInt(fbdo, basePath, 0);
         lastOnMillis[i] = now; // update last print time
       }
     } 
@@ -325,6 +326,8 @@ void applySchedules()
       {
         serial_out(i,0);
         off_transfer_counter[i]++;
+        String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + i;
+        Firebase.setInt(fbdo, basePath, 0);
         lastOffMillis[i] = now;
       }
     } 
@@ -434,6 +437,24 @@ void checkForUpdates(String binUrl)
       break;
   }
 }
+
+void resetSwitchesIfPowerOn() 
+{
+  String reason = ESP.getResetReason();
+  Serial.println("Reset Reason: " + reason);
+
+  if ((reason.indexOf("Power") != -1) || (reason.indexOf("External") != -1)) 
+  {  // Check if it contains "Power"
+    Serial.println("Power-on detected. Resetting switches...");
+
+    for (int i = 1; i <= MAX_SWITCH_NO; i++) 
+    {
+      String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + String(i);
+      Firebase.setInt(fbdo, basePath.c_str(), 0);
+    }
+  }
+}
+
 void setup()
 {
   ESP.wdtDisable(); 
@@ -493,12 +514,7 @@ void setup()
       Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/FREE_RAM", String(ESP.getFreeHeap()));
       Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 
-
-      for(int i = 1;i<= MAX_SWITCH_NO;i++)
-      {
-        String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + String(i);
-        Firebase.setInt(fbdo, basePath, 3);
-      }
+      resetSwitchesIfPowerOn();
       readSchedulesFromFirebase();
       initStream();
     }
@@ -521,7 +537,8 @@ void loop()
   }
   if (offline_flag || WiFi.status() != WL_CONNECTED || !system_status) 
   {
-    Serial.println("Offline");
+    //Serial.println("Offline");
+    digitalWrite(wifiLed, HIGH);
     if (offlineStartTime == 0) 
     {
       offlineStartTime = millis();   // mark the time when offline started

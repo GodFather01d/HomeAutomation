@@ -1,4 +1,4 @@
-#define firmware_version 1.6
+#define firmware_version 1.9
 
 #include <WiFiManager.h>  
 #include <EEPROM.h>
@@ -66,6 +66,16 @@ Schedule schedules[MAX_SWITCH_NO + 1];
 void IRAM_ATTR handleButtonPress() 
 {
   buttonPressed = true;
+}
+void Blink_led(int state ,int speed)
+{
+  for(int i=0;i<=3;i++)
+  {
+    digitalWrite(wifiLed,state);
+    delay(speed);
+    digitalWrite(wifiLed,!state);
+    delay(speed);
+  }
 }
 void settime()
 {
@@ -159,6 +169,18 @@ void handleStream()
           }
         } 
       }
+      if (dataPath.startsWith("/SET_TIME")) 
+      {
+        if (value == 1) 
+        {
+          if(Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/SET_TIME", 0))
+          {
+            readSchedulesFromFirebase();
+            Blink_led(1,100);
+          }
+        } 
+      }
+      
       if (dataPath.startsWith("/ONLINE_STATUS")) 
       {
         if (value == 0) 
@@ -309,7 +331,7 @@ void applySchedules()
         serial_out(i,1);
         on_transfer_counter[i]++;
         String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + i;
-        Firebase.setInt(fbdo, basePath, 0);
+        Firebase.setInt(fbdo, basePath, 1);
         lastOnMillis[i] = now; // update last print time
       }
     } 
@@ -341,6 +363,7 @@ void applySchedules()
 void serial_out(int switch_no, int state)
 {
   String path = String(sys_id) + "_" + String(switch_no) + "_" + String(state);
+  Serial.println();
   Serial.println(path);
 
 }
@@ -354,13 +377,7 @@ void serial_out(int switch_no, int state)
   {
     Serial.println("Failed to stop stream");
   }
-  for(int i = 0;i<= 5;i++)
-  {
-    digitalWrite(wifiLed,HIGH);
-    delay(500);
-    digitalWrite(wifiLed,LOW);
-    delay(500);
-  }
+  Blink_led(0,500);
   WiFiManagerParameter sys_id_param("sys_id", "System ID", sys_id, 32);
   wm.addParameter(&sys_id_param);
   wm.setConfigPortalTimeout(180);
@@ -375,13 +392,7 @@ void serial_out(int switch_no, int state)
     EEPROM.write(SYS_ID_ADDR + i, sys_id[i]);
   }
   EEPROM.commit();
-  for(int i = 0;i<= 5;i++)
-  {
-    digitalWrite(wifiLed,HIGH);
-    delay(500);
-    digitalWrite(wifiLed,LOW);
-    delay(500);
-  }
+  Blink_led(0,500);
   ESP.restart();
  }
 
@@ -508,6 +519,7 @@ void setup()
       Serial.println("Sign-in successful!");
       Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/UPDATE", 0);
       Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/RESET", 0);
+      Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/SET_TIME", 0);
       Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
       Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/FIRMWARE_VERSION", firmware_version);
       Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/RESET_REASON", ESP.getResetInfo());
@@ -515,7 +527,7 @@ void setup()
       Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 
       resetSwitchesIfPowerOn();
-      readSchedulesFromFirebase();
+      //readSchedulesFromFirebase();
       initStream();
     }
     delay(1000);

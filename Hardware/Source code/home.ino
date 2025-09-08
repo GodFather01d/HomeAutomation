@@ -37,7 +37,7 @@ const unsigned long OFFLINE_TIMEOUT = 2UL * 60UL * 1000UL;
 char sys_id[32]; 
 volatile bool buttonPressed = false, system_status = true, signupOK = false, offline_flag = false;
 uint8_t update_ota = 1, curr_switch_on = 0, curr_switch_off = 0,time_hours = 0, time_mint = 0,currentMonth = 0,currentDay = 0;
-uint16_t offline_time = 5, offline_counter = 0,currentYear = 0; 
+uint16_t offline_counter = 0,currentYear = 0; 
 int on_transfer_counter[MAX_SWITCH_NO + 1] = {0};
 int off_transfer_counter[MAX_SWITCH_NO + 1] = {0};
 

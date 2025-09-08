@@ -1,4 +1,4 @@
-#define firmware_version 2.2
+#define firmware_version 2.4
 
 #include <WiFiManager.h>  
 #include <EEPROM.h>
@@ -13,8 +13,9 @@
 #include <ESP8266httpUpdate.h>
 
 #define wifiLed 2            //  D4   wifi led
-#define TRIGGER_PIN 14       //  D5   wifi setup pin access point
-
+#define TRIGGER_PIN 14          // wifi setup pin AP
+#define TRANSFER_IND_PIN 12       //  D6   data transfer indication pin 
+    
 #define API_KEY "AIzaSyAQh-tAWmKpcGzwmXISv0-aY-Q4s6MAxZc"
 #define DATABASE_URL "homeautomation-e6ef2-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
@@ -43,7 +44,7 @@ int off_transfer_counter[MAX_SWITCH_NO + 1] = {0};
 
 unsigned long lastOnMillis[MAX_SWITCH_NO + 1] = {0};
 unsigned long lastOffMillis[MAX_SWITCH_NO + 1] = {0};
-const unsigned long PRINT_INTERVAL = 15000; 
+const unsigned long PRINT_INTERVAL = 2000; 
 
 struct Schedule 
 {
@@ -80,7 +81,7 @@ void Blink_led(int state ,int speed)
 void settime()
 {
   if (buttonPressed) return;
-  if(currentYear < 2000)
+  if(currentYear < 2024)
   {
     timeClient.update();
   }
@@ -134,20 +135,30 @@ void handleStream()
         int switch_no = swNumber.toInt();  // extract number after "SW"
         if (value == 1) 
         {
-          for(int i = 0;i < 3;i++)
+          digitalWrite(TRANSFER_IND_PIN, LOW);
+
+          for(int i = 0;i < 2;i++)
           {
             serial_out(switch_no,1);
             delay(1000);
           } 
+          digitalWrite(TRANSFER_IND_PIN, HIGH);
+
           //serial_out(switch_no,1);
         } 
         else if (value == 0)
         {
-          for(int i = 0;i < 3;i++)
+          digitalWrite(TRANSFER_IND_PIN, LOW);
+
+          for(int i = 0;i < 2;i++)
           {
+
             serial_out(switch_no,0);
             delay(1000);
+
           } 
+          digitalWrite(TRANSFER_IND_PIN, HIGH);
+
         }
 
         system_status = Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
@@ -195,7 +206,7 @@ void handleStream()
 void readlink_from_firebase()
 {
   EEPROM.put(EEPROM_UPDATE, 1);
-  String path = "SYSTEM/UPDATE_LINK";
+  String path = "ADDITIONAL_INFO/UPDATE_LINK";
   if (Firebase.getString(fbdo, path)) 
   {
     if (fbdo.dataType() == "string") 
@@ -335,6 +346,14 @@ void applySchedules()
         Firebase.setInt(fbdo, basePath, 1);
         lastOnMillis[i] = now; // update last print time
       }
+      if (on_transfer_counter[i] >= 0 && on_transfer_counter[i] < 2)
+      {
+        digitalWrite(TRANSFER_IND_PIN, LOW);
+      }
+      else
+      {
+        digitalWrite(TRANSFER_IND_PIN, HIGH);
+      }
     } 
     else 
     {
@@ -353,6 +372,14 @@ void applySchedules()
         Firebase.setInt(fbdo, basePath, 0);
         lastOffMillis[i] = now;
       }
+      if (off_transfer_counter[i] >= 0 && off_transfer_counter[i] < 3)
+      {
+        digitalWrite(TRANSFER_IND_PIN, LOW);
+      }
+      else
+      {
+        digitalWrite(TRANSFER_IND_PIN, HIGH);
+      }
     } 
     else 
     {
@@ -361,9 +388,9 @@ void applySchedules()
     }
   }
 }
-void serial_out(int switch_no, int state) {
+void serial_out(int switch_no, int state) 
+{
   char buffer[10];
-
   // Format switch number as two digits (01, 02, ..., 10, ...)
   sprintf(buffer, "%02d", switch_no);
 
@@ -484,8 +511,12 @@ void setup() {
 
     // Initialize pins
     pinMode(wifiLed, OUTPUT);
-    digitalWrite(wifiLed, LOW); // OFF by default
+    digitalWrite(wifiLed, HIGH); // OFF by default
     pinMode(TRIGGER_PIN, INPUT_PULLUP);
+    pinMode(TRANSFER_IND_PIN, OUTPUT);
+    digitalWrite(TRANSFER_IND_PIN, HIGH); // OFF by default
+
+
 
     // Initialize EEPROM
     EEPROM.begin(EEPROM_SIZE);

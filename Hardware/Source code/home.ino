@@ -1,4 +1,4 @@
-#define firmware_version 2.4
+#define FIRMWARE_VERSION 3.5
 
 #include <WiFiManager.h>  
 #include <EEPROM.h>
@@ -77,6 +77,11 @@ void Blink_led(int state ,int speed)
     digitalWrite(wifiLed,!state);
     delay(speed);
   }
+}
+void send_online()
+{
+  FirebaseData fbdo2 ;
+  system_status = Firebase.setInt(fbdo2, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
 }
 void settime()
 {
@@ -401,8 +406,9 @@ void serial_out(int switch_no, int state)
   Serial.println();
   Serial.println(path);
 }
- void setupConfigPortal() 
- {
+void setupConfigPortal() 
+{
+  // WiFiManager wm;
   if (Firebase.endStream(fbdo)) 
   {
     Serial.println("Stream stopped successfully");
@@ -412,9 +418,11 @@ void serial_out(int switch_no, int state)
     Serial.println("Failed to stop stream");
   }
   Blink_led(0,500);
+  wm.setCaptivePortalEnable(true);
   WiFiManagerParameter sys_id_param("sys_id", "System ID", sys_id, 32);
   wm.addParameter(&sys_id_param);
   wm.setConfigPortalTimeout(180);
+  delay(1000);
 
   if (!wm.startConfigPortal("JT_WIFI_SETUP","Jyoti@2000") )
   {
@@ -428,7 +436,7 @@ void serial_out(int switch_no, int state)
   EEPROM.commit();
   Blink_led(0,500);
   ESP.restart();
- }
+}
 
 void readSysIdFromEEPROM() 
 {
@@ -499,99 +507,88 @@ void resetSwitchesIfPowerOn()
     }
   }
 }
-void setup() {
-    // Start Serial immediately
+void setup() 
+{
+  ESP.wdtDisable();           // disable first
+  //ESP.wdtEnable(8000);        // enable with timeout (ms) → max ~8s
+  pinMode(wifiLed, OUTPUT);
+  digitalWrite(wifiLed, HIGH); // OFF by default
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);
+  pinMode(TRANSFER_IND_PIN, OUTPUT);
+  digitalWrite(TRANSFER_IND_PIN, HIGH); // OFF by default
+
+  EEPROM.begin(EEPROM_SIZE);
+  update_ota = EEPROM.read(EEPROM_UPDATE); // single byte
+  readSysIdFromEEPROM();
+
+  // WiFi setup
+  wm.setConfigPortalTimeout(10);
+  if (wm.autoConnect("JT_WIFI_SETUP", "Jyoti@2000")) 
+  {
     Serial.begin(9600);
     delay(1000);
+    Serial.println("WiFi connected");
     Serial.print("Firmware version: ");
-    Serial.println(firmware_version);
-
-    // Disable watchdog (optional, be careful)
-   // ESP.wdtDisable();
-
-    // Initialize pins
-    pinMode(wifiLed, OUTPUT);
-    digitalWrite(wifiLed, HIGH); // OFF by default
-    pinMode(TRIGGER_PIN, INPUT_PULLUP);
-    pinMode(TRANSFER_IND_PIN, OUTPUT);
-    digitalWrite(TRANSFER_IND_PIN, HIGH); // OFF by default
-
-
-
-    // Initialize EEPROM
-    EEPROM.begin(EEPROM_SIZE);
-    update_ota = EEPROM.read(EEPROM_UPDATE); // single byte
-    readSysIdFromEEPROM();
-
-    // WiFi setup
-    wm.setConfigPortalTimeout(10);
-    if (wm.autoConnect("JT_WIFI_SETUP", "Jyoti@2000")) 
+    Serial.println(FIRMWARE_VERSION);
+    Serial.print("system id: ");
+    Serial.println(String(sys_id));
+    // OTA update check
+    if (update_ota == 1) 
     {
-        Serial.println("WiFi connected");
+      String link = readUpdateLinkFromEEPROM();
+      EEPROM.write(EEPROM_UPDATE, 0); // reset OTA flag
+      EEPROM.commit();
+      checkForUpdates(link);
+    } 
+    else if (EEPROM.read(EEPROM_UPDATE) != 0) 
+    {
+      EEPROM.write(EEPROM_UPDATE, 0);
+      EEPROM.commit();
+    }
 
-        // OTA update check
-        if (update_ota == 1) 
-        {
-            String link = readUpdateLinkFromEEPROM();
-            EEPROM.write(EEPROM_UPDATE, 0); // reset OTA flag
-            EEPROM.commit();
-            checkForUpdates(link);
-        } 
-        else if (EEPROM.read(EEPROM_UPDATE) != 0) 
-        {
-            EEPROM.write(EEPROM_UPDATE, 0);
-            EEPROM.commit();
-        }
+    timeClient.begin();
 
-        // NTP and Firebase setup
-        timeClient.begin();
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
 
-        config.api_key = API_KEY;
-        config.database_url = DATABASE_URL;
+    if (Firebase.signUp(&config, &auth, "", "")) 
+    { // empty email/password for anonymous auth
+      signupOK = true;
+      config.token_status_callback = tokenStatusCallback;
+      Firebase.begin(&config, &auth);
+      Firebase.reconnectWiFi(true);
+      delay(1000);
 
-        if (Firebase.signUp(&config, &auth, "", "")) 
-        { // empty email/password for anonymous auth
-            signupOK = true;
-            config.token_status_callback = tokenStatusCallback;
-            Firebase.begin(&config, &auth);
-            Firebase.reconnectWiFi(true);
-            delay(1000);
+      Serial.println("sign-in successful!");
 
-            Serial.println("sign-in successful!");
+      // Initialize Firebase buttons and system info
+      Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/UPDATE", 0);
+      Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/RESET", 0);
+      Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/SET_TIME", 0);
+      Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
 
-            // Initialize Firebase buttons and system info
-            Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/UPDATE", 0);
-            Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/RESET", 0);
-            Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/SET_TIME", 0);
-            Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
-
-            Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/FIRMWARE_VERSION", firmware_version);
-            Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/RESET_REASON", ESP.getResetInfo());
-            Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/FREE_RAM", String(ESP.getFreeHeap()));
-
-            //Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-
-            // Initialize system
-            resetSwitchesIfPowerOn();
-            initStream();
-            digitalWrite(wifiLed, LOW); // LED ON when connected
-
-        } 
-        else 
-        {
-            Serial.println("Firebase sign-in failed!");
-        }
-
+      Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/FIRMWARE_VERSION", FIRMWARE_VERSION);
+      Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/RESET_REASON", ESP.getResetInfo());
+      Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/FREE_RAM", String(ESP.getFreeHeap()));
+      resetSwitchesIfPowerOn();
+      initStream();
+      digitalWrite(wifiLed, LOW); // LED ON when connected
     } 
     else 
     {
-        Serial.println("WiFi connection failed, offline mode");
-        digitalWrite(wifiLed, HIGH); // LED OFF when offline
-        offline_flag = true;
+      Serial.println("Firebase sign-in failed!");
+      return;
     }
 
-    // Attach ISR
-    attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), handleButtonPress, CHANGE);
+  } 
+  else 
+  {
+      //Serial.println("WiFi connection failed, offline mode");
+    digitalWrite(wifiLed, HIGH); // LED OFF when offline
+    offline_flag = true;
+  }
+  // Attach ISR
+  attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), handleButtonPress, CHANGE);
 }
 
 void loop() 
@@ -603,16 +600,13 @@ void loop()
   }
   if (offline_flag || WiFi.status() != WL_CONNECTED || !system_status) 
   {
-    //Serial.println("Offline");
     digitalWrite(wifiLed, HIGH);
     if (offlineStartTime == 0) 
     {
       offlineStartTime = millis();   // mark the time when offline started
     }
-
     if (millis() - offlineStartTime >= OFFLINE_TIMEOUT) 
     {
-      Serial.println("Offline for 5 minutes, restarting...");
       ESP.restart();   // reset ESP
     }
   } 
@@ -623,5 +617,7 @@ void loop()
     settime();
     get_serial();
     applySchedules();
+    //send_online();
   }
+ // ESP.wdtFeed();              // feed watchdog
 }

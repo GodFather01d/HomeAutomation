@@ -1,4 +1,4 @@
-#define FIRMWARE_VERSION 3.5
+#define FIRMWARE_VERSION 4.0
 
 #include <WiFiManager.h>  
 #include <EEPROM.h>
@@ -343,7 +343,7 @@ void applySchedules()
     if (!schedules[i].valid) continue;
     if (time_hours == schedules[i].onHour && time_mint == schedules[i].onMin) 
     {
-      if (on_transfer_counter[i] < 3 && now - lastOnMillis[i] >= PRINT_INTERVAL) 
+      if (on_transfer_counter[i] < 2 && now - lastOnMillis[i] >= PRINT_INTERVAL) 
       {
         serial_out(i,1);
         on_transfer_counter[i]++;
@@ -369,7 +369,7 @@ void applySchedules()
     // --- OFF TIME ---
     if (time_hours == schedules[i].offHour && time_mint == schedules[i].offMin) 
     {
-      if (off_transfer_counter[i] < 3 && now - lastOffMillis[i] >= PRINT_INTERVAL) 
+      if (off_transfer_counter[i] < 2 && now - lastOffMillis[i] >= PRINT_INTERVAL) 
       {
         serial_out(i,0);
         off_transfer_counter[i]++;
@@ -409,14 +409,22 @@ void serial_out(int switch_no, int state)
 void setupConfigPortal() 
 {
   // WiFiManager wm;
-  if (Firebase.endStream(fbdo)) 
-  {
-    Serial.println("Stream stopped successfully");
-  } 
-  else 
-  {
-    Serial.println("Failed to stop stream");
-  }
+
+ Serial.println("Free RAM before cleanup: " + String(ESP.getFreeHeap()));
+
+  // Stop Firebase
+  Firebase.endStream(fbdo);
+  fbdo.clear();
+
+  // Stop NTP
+  timeClient.end();
+
+  // Disconnect WiFi
+  WiFi.disconnect(true);
+  delay(100);
+
+  Serial.println("Free RAM after cleanup: " + String(ESP.getFreeHeap()));
+
   Blink_led(0,500);
   wm.setCaptivePortalEnable(true);
   WiFiManagerParameter sys_id_param("sys_id", "System ID", sys_id, 32);

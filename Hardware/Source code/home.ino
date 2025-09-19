@@ -1,4 +1,4 @@
-#define FIRMWARE_VERSION 4.0
+#define FIRMWARE_VERSION 5.0
 
 #include <WiFiManager.h>  
 #include <EEPROM.h>
@@ -36,7 +36,7 @@ const unsigned long timeout = 20000;
 unsigned long offlineStartTime = 0; 
 const unsigned long OFFLINE_TIMEOUT = 2UL * 60UL * 1000UL; 
 char sys_id[32]; 
-volatile bool buttonPressed = false, system_status = true, signupOK = false, offline_flag = false;
+volatile bool buttonPressed = false, signupOK = false, offline_flag = false;
 uint8_t update_ota = 1, curr_switch_on = 0, curr_switch_off = 0,time_hours = 0, time_mint = 0,currentMonth = 0,currentDay = 0;
 uint16_t offline_counter = 0,currentYear = 0; 
 int on_transfer_counter[MAX_SWITCH_NO + 1] = {0};
@@ -80,8 +80,13 @@ void Blink_led(int state ,int speed)
 }
 void send_online()
 {
-  FirebaseData fbdo2 ;
-  system_status = Firebase.setInt(fbdo2, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
+  if(!Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1))
+  {
+    if(!Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1))
+    {
+      ESP.restart();
+    }
+  }
 }
 void settime()
 {
@@ -165,8 +170,7 @@ void handleStream()
           digitalWrite(TRANSFER_IND_PIN, HIGH);
 
         }
-
-        system_status = Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
+        send_online();
       }
       if (dataPath.startsWith("/UPDATE")) 
       {
@@ -202,7 +206,7 @@ void handleStream()
       {
         if (value == 0) 
         {
-          system_status = Firebase.setInt(fbdo, "SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
+          send_online();
         } 
       }
     }
@@ -301,7 +305,7 @@ void get_serial()
         }
       } 
       else 
-      {      ESP.restart();
+      {     
 
         Serial.println("Invalid format: " + s);
       }
@@ -517,7 +521,7 @@ void resetSwitchesIfPowerOn()
 }
 void setup() 
 {
-  ESP.wdtDisable();           // disable first
+ // ESP.wdtDisable();           // disable first
   //ESP.wdtEnable(8000);        // enable with timeout (ms) → max ~8s
   pinMode(wifiLed, OUTPUT);
   digitalWrite(wifiLed, HIGH); // OFF by default
@@ -580,7 +584,7 @@ void setup()
       Firebase.set(fbdo, "SYSTEM/" + String(sys_id) + "/SYSTEM_INFO/FREE_RAM", String(ESP.getFreeHeap()));
       resetSwitchesIfPowerOn();
       initStream();
-      digitalWrite(wifiLed, LOW); // LED ON when connected
+      digitalWrite(wifiLed, LOW); 
     } 
     else 
     {
@@ -601,12 +605,17 @@ void setup()
 
 void loop() 
 {
-  if (buttonPressed || digitalRead(TRIGGER_PIN) == LOW)
+  if (buttonPressed)
   {
-    buttonPressed = false;
-    setupConfigPortal();
+    delay(1000);
+    if(digitalRead(TRIGGER_PIN) == LOW)
+    {
+      buttonPressed = false;
+      setupConfigPortal();
+    }
+   
   }
-  if (offline_flag || WiFi.status() != WL_CONNECTED || !system_status) 
+  if (WiFi.status() != WL_CONNECTED) 
   {
     digitalWrite(wifiLed, HIGH);
     if (offlineStartTime == 0) 
@@ -620,12 +629,12 @@ void loop()
   } 
   else 
   {
+    digitalWrite(wifiLed, LOW);
     offlineStartTime = 0;
     handleStream();
     settime();
     get_serial();
     applySchedules();
-    //send_online();
   }
  // ESP.wdtFeed();              // feed watchdog
 }

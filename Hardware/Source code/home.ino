@@ -1,4 +1,4 @@
-#define FIRMWARE_VERSION 5.0
+#define FIRMWARE_VERSION 5.5
 
 #include <WiFiManager.h>  
 #include <EEPROM.h>
@@ -27,6 +27,8 @@
 #define EEPROM_UPDATE 30
 #define UPDATE_LINK_ADDER 35
 #define MAX_SWITCH_NO 25
+#define MAX_PATH_LEN 80
+#define STREAM_RETRY_LIMIT 4
 
 const char AP_ID[] = "JT_WiFi_SETUP", AP_PASS[] = "Jyoti@2000";
 const long utcOffsetInSeconds = 19800;
@@ -45,6 +47,14 @@ int off_transfer_counter[MAX_SWITCH_NO + 1] = {0};
 unsigned long lastOnMillis[MAX_SWITCH_NO + 1] = {0};
 unsigned long lastOffMillis[MAX_SWITCH_NO + 1] = {0};
 const unsigned long PRINT_INTERVAL = 2000; 
+
+
+
+// new globals
+unsigned int stream_fail_count = 0;
+unsigned long lastStreamReconnect = 0;
+const unsigned long STREAM_RECONNECT_INTERVAL = 10UL * 1000UL; // 10s between reconnect attempts
+
 
 struct Schedule 
 {
@@ -112,7 +122,7 @@ void initStream()
 
   if (!Firebase.beginStream(fbdo, path))
   {
-    //Serial.println("Stream begin error: " + fbdo.errorReason());
+    Serial.println("Stream begin error: " + fbdo.errorReason());
     return;
   }
   else
@@ -124,14 +134,36 @@ void handleStream()
 {
   if (!Firebase.readStream(fbdo)) 
   {
-    // Serial.println("Stream read error: " + fbdo.errorReason());
+    // read error
+    Serial.println("Stream read failed: " + fbdo.errorReason());
+    // on read failure, increment counter and try re-init after a few failures or after timeout
+    stream_fail_count++;
+    if (stream_fail_count >= STREAM_RETRY_LIMIT) {
+      Serial.println("Stream failing repeatedly - restarting stream...");
+      Firebase.endStream(fbdo);
+      delay(200);
+      initStream();
+      stream_fail_count = 0;
+    }
     return;
   }
+
+  // reset failure counter on successful read
+  stream_fail_count = 0;
+
   if (fbdo.streamTimeout()) 
   {
-   // Serial.println("Stream timeout, resuming...");
+    Serial.println("Stream timeout, will attempt to resume.");
+    // attempt to re-init stream (but don't spam)
+    if (millis() - lastStreamReconnect >= STREAM_RECONNECT_INTERVAL) {
+      lastStreamReconnect = millis();
+      Firebase.endStream(fbdo);
+      delay(100);
+      initStream();
+    }
     return;
   }
+
   if (fbdo.streamAvailable()) 
   {
     if (fbdo.dataType() == "int") 
@@ -150,8 +182,10 @@ void handleStream()
           for(int i = 0;i < 2;i++)
           {
             serial_out(switch_no,1);
+            
             delay(1000);
           } 
+          send_switch_state_safe(switch_no,true);
           digitalWrite(TRANSFER_IND_PIN, HIGH);
 
           //serial_out(switch_no,1);
@@ -167,6 +201,7 @@ void handleStream()
             delay(1000);
 
           } 
+          send_switch_state_safe(switch_no,false);
           digitalWrite(TRANSFER_IND_PIN, HIGH);
 
         }
@@ -248,21 +283,43 @@ void readlink_from_firebase()
     Serial.println("Failed to fetch update link: " + fbdo.errorReason());
   }
 }
-void send_notification(int switch_no,int state)
+bool send_switch_state_safe(int switch_no, bool state) 
 {
-  String basePath = "SYSTEM/" + String(sys_id) + "/NOTIFICATION/SW" + String(switch_no);
-  String update_time = (String(time_hours)+" : "+String(time_mint)+ "_" );
-  String update_date = (String(currentDay)+" / "+String(currentMonth)+" / "+String(currentYear));
-  if(Firebase.setString(fbdo, "SYSTEM/" + String(sys_id) + "/NOTIFICATION/NOTIFICATION_TIME/",update_time + update_date))
+  char path[MAX_PATH_LEN];
+  // path: SYSTEM/<sys_id>/SWITCH_STATE/SW<no>
+  snprintf(path, sizeof(path), "SYSTEM/%s/SWITCH_STATE/SW%d", sys_id, switch_no);
+  if(send_notification_safe(switch_no,state))
   {
-    Firebase.setInt(fbdo, basePath, state);
+    return Firebase.setInt(fbdo, path, (int)state);
   }
+  else 
+  {
+    return false;
+  }
+  // use Firebase.setInt and return result
+  
 }
-void send_switch_state(int switch_no, bool state) 
+
+// ---------- safer notification ----------
+bool send_notification_safe(int switch_no,int state)
 {
-  String basePath = "SYSTEM/" + String(sys_id) + "/SWITCH_STATE/SW" + String(switch_no);
-  Firebase.setInt(fbdo, basePath, state);
+  char path[MAX_PATH_LEN];
+  snprintf(path, sizeof(path), "SYSTEM/%s/NOTIFICATION/SW%d", sys_id, switch_no);
+  // update time string (still using String for time is OK once in a while)
+  String update_time = (String(time_hours)+" : "+String(time_mint)+ "_" );
+  String update_date = (String(currentDay)+" / "+String(currentMonth)+" / "+ String(currentYear));
+  char timePath[MAX_PATH_LEN];
+  snprintf(timePath, sizeof(timePath), "SYSTEM/%s/NOTIFICATION/NOTIFICATION_TIME/", sys_id);
+  String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + String(switch_no);
+  Firebase.setInt(fbdo, basePath.c_str(), 3);
+  
+  Firebase.setString(fbdo, timePath, update_time + update_date);
+      
+         
+  return Firebase.setInt(fbdo, path, state);
+ 
 }
+
 void get_serial() 
 {
   if (Serial.available()) 
@@ -284,14 +341,12 @@ void get_serial()
         {
           if (state == 1) 
           {
-            send_switch_state(switchNo, true);
-            send_notification(switchNo, 1);
+            send_switch_state_safe(switchNo, true);
             on_transfer_counter[switchNo] = 4;
           } 
           else if (state == 0) 
           {
-            send_switch_state(switchNo, false);
-            send_notification(switchNo, 0);
+            send_switch_state_safe(switchNo, false);
             off_transfer_counter[switchNo] = 4;
           } 
           else 
@@ -399,14 +454,11 @@ void applySchedules()
 }
 void serial_out(int switch_no, int state) 
 {
-  char buffer[10];
-  // Format switch number as two digits (01, 02, ..., 10, ...)
-  sprintf(buffer, "%02d", switch_no);
-
-  // Build path string
-  String path = String(sys_id) + "_" + String(buffer) + "_" + String(state);
-
-  // Print output
+  char buffer[16];
+  // Format switch number as two digits
+  snprintf(buffer, sizeof(buffer), "%02d", switch_no);
+  char path[32];
+  snprintf(path, sizeof(path), "%s_%s_%d", sys_id, buffer, state);
   Serial.println();
   Serial.println(path);
 }
@@ -503,22 +555,32 @@ void checkForUpdates(String binUrl)
   }
 }
 
-void resetSwitchesIfPowerOn() 
-{
+void resetSwitchesIfPowerOn() {
   String reason = ESP.getResetReason();
-  //Serial.println("Reset Reason: " + reason);
+  Serial.println("Reset Reason: " + reason);
 
-  if ((reason.indexOf("Power") != -1) || (reason.indexOf("External") != -1)) 
-  {  // Check if it contains "Power"
+  // Check if reset was due to Power-on or External reset
+  if (reason.indexOf("Power") != -1 || reason.indexOf("External") != -1) {
     Serial.println("Power-on detected. Resetting switches...");
 
-    for (int i = 1; i <= MAX_SWITCH_NO; i++) 
-    {
-      String basePath = "SYSTEM/" + String(sys_id) + "/BUTTONS/SW" + String(i);
-      Firebase.setInt(fbdo, basePath.c_str(), 0);
+    for (int i = 1; i <= MAX_SWITCH_NO; i++) {
+      String sw = "SW" + String(i);
+
+      // BUTTONS path
+      String buttonsPath = "SYSTEM/" + String(sys_id) + "/BUTTONS/" + sw;
+      if (!Firebase.setInt(fbdo, buttonsPath.c_str(), 3)) {
+        Serial.println("Failed to reset " + buttonsPath + " : " + fbdo.errorReason());
+      }
+
+      // SWITCH_STATE path
+      String statePath = "SYSTEM/" + String(sys_id) + "/SWITCH_STATE/" + sw;
+      if (!Firebase.setInt(fbdo, statePath.c_str(), 3)) {
+        Serial.println("Failed to reset " + statePath + " : " + fbdo.errorReason());
+      }
     }
   }
 }
+
 void setup() 
 {
  // ESP.wdtDisable();           // disable first
@@ -629,11 +691,18 @@ void loop()
   } 
   else 
   {
+
+    if (!fbdo.httpConnected() && (millis() - lastStreamReconnect >= STREAM_RECONNECT_INTERVAL)) 
+    {
+      lastStreamReconnect = millis();
+      Serial.println("Stream not connected - attempting to begin stream");
+      initStream();
+    }
     digitalWrite(wifiLed, LOW);
     offlineStartTime = 0;
     handleStream();
     settime();
-    get_serial();
+    //get_serial();
     applySchedules();
   }
  // ESP.wdtFeed();              // feed watchdog

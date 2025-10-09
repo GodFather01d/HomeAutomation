@@ -15,8 +15,7 @@
 #include <TimeLib.h> 
 #include <FirebaseJson.h> 
 #include <HTTPUpdate.h>
-#include <WiFiClient.h>
-            // EEPROM for persistent small-data storage
+#include <WiFiClientSecure.h>            // EEPROM for persistent small-data storage
 
 // ========== Firebase Configuration ==========
 #define API_KEY "AIzaSyAQh-tAWmKpcGzwmXISv0-aY-Q4s6MAxZc"
@@ -473,30 +472,24 @@ void printAllSchedules() {
     }
 }
 
-void perform_update(String otaURL) {
-    if (otaURL.length() == 0) {
-        Serial.println("❌ OTA URL not set!");
-        return;
-    }
+void perform_update(String url) {
+  WiFiClientSecure client;
+  client.setInsecure();  // Accept all certificates (unsafe but works for ESP32 OTA)
 
-    WiFiClient client;  // Required for HTTPUpdate
-    Serial.println("🚀 Starting OTA update from: " + otaURL);
+  t_httpUpdate_return ret = httpUpdate.update(client, url);
 
-    t_httpUpdate_return ret = httpUpdate.update(client, otaURL);  // Pass WiFiClient + URL
-
-    switch (ret) {
-        case HTTP_UPDATE_FAILED:
-            Serial.printf("❌ OTA Failed: %d - %s\n",
-                          httpUpdate.getLastError(),
-                          httpUpdate.getLastErrorString().c_str());
-            break;
-        case HTTP_UPDATE_NO_UPDATES:
-            Serial.println("ℹ️ No updates available");
-            break;
-        case HTTP_UPDATE_OK:
-            Serial.println("✅ OTA Successful. Restarting...");
-            break;
-    }
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("❌ OTA Failed: %d - %s\n", httpUpdate.getLastError(),
+                    httpUpdate.getLastErrorString().c_str());
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("ℹ️ No updates available");
+      break;
+    case HTTP_UPDATE_OK:
+      Serial.println("✅ OTA Success!");
+      break;
+  }
 }
 
 // ===================================================

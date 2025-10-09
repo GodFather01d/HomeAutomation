@@ -13,7 +13,9 @@
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 #include <TimeLib.h> 
-#include <FirebaseJson.h>  // ✅ You MUST include this manually
+#include <FirebaseJson.h> 
+#include <HTTPUpdate.h>
+#include <WiFiClient.h>
             // EEPROM for persistent small-data storage
 
 // ========== Firebase Configuration ==========
@@ -331,6 +333,31 @@ void processData(AsyncResult &aResult)
       {
        readSchedulesFromFirebase();
       }
+      else if (path.startsWith("/UPDATE"))
+      {
+          int Value = data.toInt();
+          if (Value == 1)
+          {
+              // Reset the UPDATE flag immediately
+              Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/UPDATE", 0);
+
+              // Read the OTA URL from Firebase
+              String otaURL = Database.get<String>(aClient, "/ADDITIONAL_INFO/UPDATE_LINK32");
+              Serial.println("📡 OTA URL fetched: " + otaURL);
+              
+             // Serial.println("📡 OTA URL fetched: " + otaURL);
+
+              // Save last update time
+              String updatetime = String(time_hours) + ":" + String(time_mint) + " " +
+                                  String(currentDay) + "/" + String(currentMonth) + "/" + String(currentYear);
+              Database.set<String>(aClient, "/SYSTEM/" + String(sys_id) + "/LAST_UPDATE_TIME", updatetime);
+
+              // Perform OTA
+              perform_update(otaURL);
+              
+             
+          }
+      }
     }
   }
 }
@@ -446,7 +473,31 @@ void printAllSchedules() {
     }
 }
 
+void perform_update(String otaURL) {
+    if (otaURL.length() == 0) {
+        Serial.println("❌ OTA URL not set!");
+        return;
+    }
 
+    WiFiClient client;  // Required for HTTPUpdate
+    Serial.println("🚀 Starting OTA update from: " + otaURL);
+
+    t_httpUpdate_return ret = httpUpdate.update(client, otaURL);  // Pass WiFiClient + URL
+
+    switch (ret) {
+        case HTTP_UPDATE_FAILED:
+            Serial.printf("❌ OTA Failed: %d - %s\n",
+                          httpUpdate.getLastError(),
+                          httpUpdate.getLastErrorString().c_str());
+            break;
+        case HTTP_UPDATE_NO_UPDATES:
+            Serial.println("ℹ️ No updates available");
+            break;
+        case HTTP_UPDATE_OK:
+            Serial.println("✅ OTA Successful. Restarting...");
+            break;
+    }
+}
 
 // ===================================================
 // ========== MAIN SETUP & LOOP ======================
@@ -479,7 +530,7 @@ void loop()
   set_time(); // Maintain Firebase connection
   checkCachedSchedule();
   //printAllSchedules();
-  delay(1000);
+  //delay(1000);
   if (digitalRead(TRIGGER_PIN) == 0)
   {
     delay(500); // debouce & long-press style

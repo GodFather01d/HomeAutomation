@@ -1,0 +1,496 @@
+/* EEPROM-backed credentials storage for ESP32
+   Keeps WiFiManager & Firebase logic from original sketch,
+   but stores sys_id, user_email, user_pass in EEPROM instead of LittleFS.
+*/
+
+#define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+
+#include <WiFiManager.h>          // https://github.com/tzapu/WiFiManager
+#include <FirebaseClient.h>
+#include "ExampleFunctions.h"
+#include <EEPROM.h>  
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <TimeLib.h> 
+#include <FirebaseJson.h>  // ✅ You MUST include this manually
+            // EEPROM for persistent small-data storage
+
+// ========== Firebase Configuration ==========
+#define API_KEY "AIzaSyAQh-tAWmKpcGzwmXISv0-aY-Q4s6MAxZc"
+#define DATABASE_URL "https://homeautomation-e6ef2-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define AP_ID "JT_WIFI_SETUP"
+#define AP_PASS "Jyoti@2000"
+
+// Pin Definitions
+#define wifiLed 2           // D4: WiFi status LED
+#define TRIGGER_PIN 13      // D5: Pin to trigger WiFiManager AP mode
+#define TRANSFER_IND_PIN 12 // D6: Data transfer indication LED
+
+
+// ========== EEPROM Layout (bytes) ==========
+#define EEPROM_SIZE        200
+#define ADDR_SIG           0      // 1 byte signature
+#define ADDR_SYSID         1      // 20 bytes
+#define SYSID_LEN          20
+#define ADDR_EMAIL         (ADDR_SYSID + SYSID_LEN)   // 21..70 (50 bytes)
+#define EMAIL_LEN          50
+#define ADDR_PASS          (ADDR_EMAIL + EMAIL_LEN)   // 71..120 (50 bytes)
+#define PASS_LEN           50
+#define EEPROM_SIG         0xAA
+
+
+#define MAX_SWITCH_NO 25
+
+struct Schedule {
+  bool valid;
+  int onHour, onMin, offHour, offMin;
+};
+
+Schedule schedules[MAX_SWITCH_NO + 1]; 
+// ========== Global Variables ==========
+char sys_id[SYSID_LEN + 1] = "DEFAULT_SYS";
+char user_email[EMAIL_LEN + 1] = "";
+char user_pass[PASS_LEN + 1] = "";
+const long utcOffsetInSeconds = 19800;
+const unsigned long UPDATE_TIMEOUT = 20000;
+uint8_t time_hours = 0, time_mint = 0, currentMonth = 0, currentDay = 0;
+uint16_t currentYear = 0;
+
+SSL_CLIENT ssl_client, stream_ssl_client;
+using AsyncClient = AsyncClientClass;
+AsyncClient aClient(ssl_client), streamClient(stream_ssl_client);
+
+UserAuth *user_auth = nullptr;
+FirebaseApp app;
+RealtimeDatabase Database;
+AsyncResult streamResult;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+
+void processData(AsyncResult &aResult);
+
+
+
+// ----------------- EEPROM helpers -----------------
+void writeStringToEEPROM(int addr, int maxLen, const char *str) {
+  int i;
+  for (i = 0; i < maxLen; ++i) {
+    if (i < (int)strlen(str)) {
+      EEPROM.write(addr + i, (uint8_t)str[i]);
+    } else {
+      EEPROM.write(addr + i, 0); // pad with NUL
+    }
+  }
+}
+
+void readStringFromEEPROM(int addr, int maxLen, char *outBuf) {
+  for (int i = 0; i < maxLen; ++i) {
+    uint8_t b = EEPROM.read(addr + i);
+    outBuf[i] = (char)b;
+  }
+  outBuf[maxLen] = '\0'; // ensure null-terminated
+  // Trim any tail bytes after first NUL
+  for (int i = 0; i < maxLen; ++i) {
+    if (outBuf[i] == '\0') {
+      outBuf[i] = '\0';
+      break;
+    }
+  }
+}
+
+// Save sys_id, email, pass to EEPROM and commit
+void saveCredentialsToEEPROM() {
+  Serial.println("Saving credentials to EEPROM...");
+  EEPROM.write(ADDR_SIG, EEPROM_SIG);
+  writeStringToEEPROM(ADDR_SYSID, SYSID_LEN, sys_id);
+  writeStringToEEPROM(ADDR_EMAIL, EMAIL_LEN, user_email);
+  writeStringToEEPROM(ADDR_PASS, PASS_LEN, user_pass);
+  if (EEPROM.commit()) {
+    Serial.println("Credentials saved to EEPROM successfully.");
+  } else {
+    Serial.println("Failed to commit EEPROM!");
+  }
+}
+
+// Load credentials from EEPROM, return true if signature valid
+bool loadCredentialsFromEEPROM() {
+  uint8_t sig = EEPROM.read(ADDR_SIG);
+  if (sig != EEPROM_SIG) {
+    Serial.println("No valid EEPROM signature found. Using defaults.");
+    return false;
+  }
+
+  readStringFromEEPROM(ADDR_SYSID, SYSID_LEN, sys_id);
+  readStringFromEEPROM(ADDR_EMAIL, EMAIL_LEN, user_email);
+  readStringFromEEPROM(ADDR_PASS, PASS_LEN, user_pass);
+
+  Serial.println("Credentials loaded from EEPROM:");
+  Serial.print(" sys_id: "); Serial.println(sys_id);
+  Serial.print(" email : "); Serial.println(user_email);
+  // Do not print password in production logs, but show masked for debug:
+  Serial.print(" pass  : "); 
+  for (int i=0; i< (int)strlen(user_pass); ++i) Serial.print('*');
+  Serial.println();
+  return true;
+}
+
+// Optional: clear EEPROM credentials (factory reset)
+void clearCredentialsInEEPROM() {
+  Serial.println("Clearing credentials in EEPROM...");
+  for (int i = 0; i < EEPROM_SIZE; ++i) EEPROM.write(i, 0);
+  EEPROM.commit();
+  Serial.println("EEPROM cleared.");
+}
+
+// ===================================================
+// ========== WiFiManager Setup Function =============
+// ===================================================
+void openPortalAndSaveCredentials() {
+  WiFiManager wm;
+
+  // Load existing credentials from EEPROM to pre-populate portal fields (if present)
+  loadCredentialsFromEEPROM();
+
+  // Custom parameters for system ID, email, password
+  WiFiManagerParameter sysIdParam("sysid", "System ID", sys_id, SYSID_LEN);
+  WiFiManagerParameter emailParam("email", "Firebase Email", user_email, EMAIL_LEN);
+  WiFiManagerParameter passParam("pass", "Firebase Password", user_pass, PASS_LEN);
+
+  wm.addParameter(&sysIdParam);
+  wm.addParameter(&emailParam);
+  wm.addParameter(&passParam);
+
+  wm.setConfigPortalTimeout(180); // 3-minute portal timeout
+
+  Serial.println("Starting configuration portal...");
+
+  // Blocking portal: waits until connected or times out
+  if (!wm.startConfigPortal(AP_ID, AP_PASS)) {
+    Serial.println("⚠️ Portal timed out — restarting...");
+    delay(2000);
+    ESP.restart();
+  }
+
+  // If we get here, the portal was successful and we are connected to WiFi.
+  // Get the new values entered by the user.
+  strncpy(sys_id, sysIdParam.getValue(), SYSID_LEN);
+  sys_id[SYSID_LEN] = '\0';
+  strncpy(user_email, emailParam.getValue(), EMAIL_LEN);
+  user_email[EMAIL_LEN] = '\0';
+  strncpy(user_pass, passParam.getValue(), PASS_LEN);
+  user_pass[PASS_LEN] = '\0';
+
+  // Save the new credentials to EEPROM.
+  saveCredentialsToEEPROM();
+
+  Serial.println("✅ Portal finished. Wi-Fi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ===================================================
+// ========== WiFi connection + load =================
+// ===================================================
+bool connectWiFiAndLoadCredentials() {
+  // Initialize EEPROM and try to load credentials from it
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    Serial.println("EEPROM begin failed!");
+  } else {
+    Serial.println("EEPROM initialized.");
+    loadCredentialsFromEEPROM(); // attempt load (if signature exists)
+  }
+
+  Serial.println("Trying Wi-Fi connection for 10 seconds...");
+
+  WiFi.begin(); // ESP32 automatically uses stored WiFi credentials
+
+  unsigned long startAttemptTime = millis();
+  bool wifiConnected = false;
+
+  while (millis() - startAttemptTime < 10000) { // 10 seconds
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      break;
+    }
+    delay(200);
+  }
+
+  if (wifiConnected) {
+    Serial.println("✅ Wi-Fi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("❌ Wi-Fi not connected in 10 sec (Skipping WiFiManager Auto Portal)");
+    return false;
+  }
+}
+
+
+// ===================================================
+// ========== FIREBASE SETUP =========================
+// ===================================================
+void firebase_setup()
+{
+  Firebase.printf("Firebase Client v%s\n", FIREBASE_CLIENT_VERSION);
+
+  set_ssl_client_insecure_and_buffer(ssl_client);
+  set_ssl_client_insecure_and_buffer(stream_ssl_client);
+
+  Serial.println("Initializing Firebase...");
+  user_auth = new UserAuth(API_KEY, user_email, user_pass, 3000);
+
+  initializeApp(aClient, app, getAuth(*user_auth), auth_debug_print, "🔐 authTask");
+
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+
+  Serial.println("Waiting for Firebase authentication (Max 60 sec)...");
+
+  unsigned long startTime = millis();
+  bool authSuccess = false;
+
+  while (millis() - startTime < 60000) // 60 sec timeout
+  {
+    app.loop();
+    if (app.isAuthenticated())
+    {
+      authSuccess = true;
+      break;
+    }
+    delay(100);
+  }
+
+  if (!authSuccess) {
+    Serial.println("❌ Firebase authentication FAILED after 60 seconds!");
+    return; // Exit without proceeding
+  }
+
+  Serial.println("✅ Authenticated Successfully!");
+
+  // ===== Clear previous nodes =====
+  Database.remove(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS");
+  Database.remove(aClient, "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE");
+  Serial.println("Old nodes cleared ✅");
+
+  // ===== Start streaming BUTTONS path =====
+  Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
+  streamClient.setSSEFilters("put,patch,keep-alive");
+  Database.get(streamClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS", processData, true, "streamTask");
+
+  Serial.println("📡 Firebase stream started...");
+}
+
+
+// ===================================================
+// ========== STREAM HANDLER =========================
+// ===================================================
+void processData(AsyncResult &aResult)
+{
+  if (!aResult.isResult()) return;
+
+  if (aResult.available())
+  {
+    RealtimeDatabaseResult &stream = aResult.to<RealtimeDatabaseResult>();
+    if (stream.isStream())
+    {
+      String path = stream.dataPath();
+      String data = stream.to<String>();
+
+      if (path.startsWith("/SW"))
+      {
+        int swValue = data.toInt();
+        String swName = path.substring(1); // remove '/'
+
+        if (swValue == 1)
+        {
+          Serial.printf("%s_ON\n", swName.c_str());
+          String statePath = "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE/" + swName;
+          Database.set<int>(aClient, statePath, 1);
+          Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
+        }
+        else if(swValue == 0)
+        {
+          Serial.printf("%s_OFF\n", swName.c_str());
+          String statePath = "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE/" + swName;
+          Database.set<int>(aClient, statePath, 0);
+          Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
+        }
+      
+        
+          String resetpath = "/SYSTEM/" + String(sys_id) + "/BUTTONS/" + swName;
+          Database.set<int>(aClient, resetpath, 3);
+        //delay(1000);
+      }
+      else if (path.startsWith("/ONLINE"))
+      {
+        Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
+      }
+      else if (path.startsWith("/SET_TIME"))
+      {
+       readSchedulesFromFirebase();
+      }
+    }
+  }
+}
+void set_time() {
+  if (currentYear < 2024) 
+  {
+    timeClient.update();
+  }
+  time_hours = timeClient.getHours();
+  time_mint = timeClient.getMinutes();
+  unsigned long epochTime = timeClient.getEpochTime();
+  currentYear = year(epochTime);
+  currentMonth = month(epochTime);
+  currentDay = day(epochTime);
+}
+// 1–25 (ignore index 0)
+
+void readSchedulesFromFirebase() {
+    if (!app.isAuthenticated()) {
+        Serial.println("❌ Firebase not authenticated. Skipping schedule load.");
+        return;
+    }
+
+    String path = "/SYSTEM/" + String(sys_id) + "/SCHEDULED";
+    Serial.println("📥 Requesting schedules JSON...");
+
+    AsyncResult result;
+    Database.get(aClient, path.c_str(), result);  // ✅ Non-blocking async request
+
+    // ✅ Wait until Firebase returns data (available())
+    unsigned long t = millis();
+    while (millis() - t < 3000) {  // max wait 3 sec
+        app.loop();
+        if (result.available()) break;
+    }
+
+    if (!result.available()) {
+        Serial.println("⚠️ No data received (timeout or no node found)");
+        return;
+    }
+
+    if (result.error().code() == 0) {  
+        // ✅ Extract data correctly
+        RealtimeDatabaseResult &rdb = result.to<RealtimeDatabaseResult>();
+        String jsonStr = rdb.to<String>();  // ✅ Now valid
+        Serial.println("📦 JSON Received:");
+        Serial.println(jsonStr);
+
+        FirebaseJson json;
+        json.setJsonData(jsonStr);
+        FirebaseJsonData data;
+
+        for (int i = 1; i <= MAX_SWITCH_NO; i++) {
+            String sw_key = "SW" + String(i);
+
+            if (json.get(data, sw_key)) {
+                schedules[i].valid = true;
+
+                FirebaseJson swObj;
+                swObj.setJsonData(data.to<String>());
+
+                swObj.get(data, "ON_HR");
+                if (data.success) schedules[i].onHour = data.to<int>();
+
+                swObj.get(data, "ON_MIN");
+                if (data.success) schedules[i].onMin = data.to<int>();
+
+                swObj.get(data, "OFF_HR");
+                if (data.success) schedules[i].offHour = data.to<int>();
+
+                swObj.get(data, "OFF_MIN");
+                if (data.success) schedules[i].offMin = data.to<int>();
+            } else {
+                schedules[i].valid = false;
+            }
+        }
+
+        Serial.println("✅ Schedules loaded and cached.");
+    } else {
+        Serial.print("❌ Firebase Error: ");
+        Serial.println(result.error().message());
+    }
+}
+void checkCachedSchedule() {
+    // Print current time for debugging
+    
+
+    for (int i = 1; i <= MAX_SWITCH_NO; i++) {
+        if (schedules[i].valid) {
+            if (time_hours == schedules[i].onHour && time_mint == schedules[i].onMin) {
+                Serial.printf("⏰ SW%d ON (Triggered from cache)\n", i);
+            }
+            if (time_hours == schedules[i].offHour && time_mint == schedules[i].offMin) {
+                Serial.printf("⏰ SW%d OFF (Triggered from cache)\n", i);
+            }
+        }
+    }
+}
+void printAllSchedules() {
+  Serial.printf("⏱ Current Time: %02d:%02d\n", time_hours, time_mint);
+    Serial.println(F("📋 All Switch Schedules:"));
+    for (int i = 1; i <= MAX_SWITCH_NO; i++) {
+        if (schedules[i].valid) {
+            Serial.printf("SW%d -> ON: %02d:%02d | OFF: %02d:%02d\n", 
+                          i, 
+                          schedules[i].onHour, 
+                          schedules[i].onMin, 
+                          schedules[i].offHour, 
+                          schedules[i].offMin);
+        } else {
+            Serial.printf("SW%d -> No schedule set\n", i);
+        }
+    }
+}
+
+
+
+// ===================================================
+// ========== MAIN SETUP & LOOP ======================
+// ===================================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(100);
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);
+
+  // Initialize EEPROM early
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    Serial.println("EEPROM.begin() failed!");
+  } else {
+    Serial.println("EEPROM ready");
+  }
+
+  if(connectWiFiAndLoadCredentials())
+  {
+     timeClient.begin();
+     firebase_setup();  
+     readSchedulesFromFirebase();
+  } // may open WiFiManager portal if needed
+               // initialize Firebase after credentials are loaded
+}
+
+void loop()
+{
+  app.loop();
+  set_time(); // Maintain Firebase connection
+  checkCachedSchedule();
+  //printAllSchedules();
+  delay(1000);
+  if (digitalRead(TRIGGER_PIN) == 0)
+  {
+    delay(500); // debouce & long-press style
+    if (digitalRead(TRIGGER_PIN) == 0)
+    {
+      // Open portal and save to EEPROM (instead of LittleFS)
+      openPortalAndSaveCredentials();
+      // After portal, re-init firebase with new credentials (simple approach: restart)
+      Serial.println("Restarting to apply new credentials...");
+      delay(500);
+      ESP.restart();
+    }
+  }
+}

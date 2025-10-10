@@ -1,12 +1,11 @@
-/* EEPROM-backed credentials storage for ESP32
-   Keeps WiFiManager & Firebase logic from original sketch,
-   but stores sys_id, user_email, user_pass in EEPROM instead of LittleFS.
-*/
+
 
 #define ENABLE_USER_AUTH
 #define ENABLE_DATABASE
 
-#include <WiFiManager.h>          // https://github.com/tzapu/WiFiManager
+#define FIRMWARE_VERSION 3.0
+
+#include <WiFiManager.h>    
 #include <FirebaseClient.h>
 #include "ExampleFunctions.h"
 #include <EEPROM.h>  
@@ -15,7 +14,8 @@
 #include <TimeLib.h> 
 #include <FirebaseJson.h> 
 #include <HTTPUpdate.h>
-#include <WiFiClientSecure.h>            // EEPROM for persistent small-data storage
+#include <WiFiClientSecure.h>   
+#include <esp_system.h>      
 
 // ========== Firebase Configuration ==========
 #define API_KEY "AIzaSyAQh-tAWmKpcGzwmXISv0-aY-Q4s6MAxZc"
@@ -57,6 +57,20 @@ const long utcOffsetInSeconds = 19800;
 const unsigned long UPDATE_TIMEOUT = 20000;
 uint8_t time_hours = 0, time_mint = 0, currentMonth = 0, currentDay = 0;
 uint16_t currentYear = 0;
+unsigned char readschedules_flag = 0,perform_ota_flag = 0;
+String otaURL = "";
+
+unsigned long lastWiFiCheck = 0;
+unsigned long wifiDisconnectedSince = 0;
+unsigned long firebaseAuthFailSince = 0;
+bool wifiWasConnected = true;
+bool firebaseWasAuth = true;
+
+// Prevent duplicate prints for same time
+int lastTriggeredHour = -1;
+int lastTriggeredMinute = -1;
+bool triggeredState[MAX_SWITCH_NO + 1][2];  
+// [i][0] for OFF, [i][1] for ON
 
 SSL_CLIENT ssl_client, stream_ssl_client;
 using AsyncClient = AsyncClientClass;
@@ -68,6 +82,8 @@ RealtimeDatabase Database;
 AsyncResult streamResult;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+
+
 
 void processData(AsyncResult &aResult);
 
@@ -144,6 +160,80 @@ void clearCredentialsInEEPROM() {
   Serial.println("EEPROM cleared.");
 }
 
+// ===== Function to get reset reason =====
+String getResetReasonText(esp_reset_reason_t reason)
+{
+  switch (reason)
+  {
+    case ESP_RST_POWERON:   return "Power-on Reset";
+    case ESP_RST_EXT:       return "External Reset (Reset pin)";
+    case ESP_RST_SW:        return "Software Reset";
+    case ESP_RST_PANIC:     return "Exception/Panic Reset";
+    case ESP_RST_INT_WDT:   return "Interrupt Watchdog Reset";
+    case ESP_RST_TASK_WDT:  return "Task Watchdog Reset";
+    case ESP_RST_WDT:       return "Other Watchdog Reset";
+    case ESP_RST_DEEPSLEEP: return "Wake from Deep Sleep";
+    case ESP_RST_BROWNOUT:  return "Brownout Reset";
+    case ESP_RST_SDIO:      return "SDIO Reset";
+    default:                return "Unknown Reset";
+  }
+}
+
+void uploadESPInfo()
+{
+  String basePath = "/SYSTEM/" + String(sys_id) + "/SYSTEM_INFO";
+
+  // ===== Basic Chip Info =====
+  String chipModel = String(ESP.getChipModel());
+  String chipRev = String(ESP.getChipRevision());
+  String cpuFreq = String(ESP.getCpuFreqMHz()) + " MHz";
+  String flashSize = String(ESP.getFlashChipSize() / 1024 / 1024) + " MB";
+  String sdkVer = String(ESP.getSdkVersion());
+  String reasonText = getResetReasonText(esp_reset_reason());
+
+  // ===== Network Info =====
+  String ip = WiFi.localIP().toString();
+  String mac = WiFi.macAddress();
+  String ssid = WiFi.SSID();
+  int rssi = WiFi.RSSI();
+
+  // ===== Memory and System Stats =====
+  size_t freeHeap = ESP.getFreeHeap();
+  size_t minHeap = ESP.getMinFreeHeap();
+  size_t sketchSize = ESP.getSketchSize();
+  size_t freeSketchSpace = ESP.getFreeSketchSpace();
+  uint32_t flashChipSpeed = ESP.getFlashChipSpeed() / 1000000; // MHz
+
+
+  String buildDate = String(__DATE__) + " " + String(__TIME__);
+
+  // ===== Upload All to Firebase =====
+  Database.set<String>(aClient, basePath + "/Chip_Model", chipModel);
+  Database.set<String>(aClient, basePath + "/Chip_Revision", chipRev);
+  Database.set<String>(aClient, basePath + "/CPU_Frequency", cpuFreq);
+  Database.set<String>(aClient, basePath + "/Flash_Size", flashSize);
+  Database.set<String>(aClient, basePath + "/Flash_Speed", String(flashChipSpeed) + " MHz");
+  Database.set<String>(aClient, basePath + "/SDK_Version", sdkVer);
+  Database.set<String>(aClient, basePath + "/IP_Address", ip);
+  Database.set<String>(aClient, basePath + "/MAC_Address", mac);
+  Database.set<String>(aClient, basePath + "/SSID", ssid);
+  Database.set<int>(aClient, basePath + "/RSSI_dBm", rssi);
+  Database.set<String>(aClient, basePath + "/Reset_Reason", reasonText);
+  Database.set<int>(aClient, basePath + "/Free_Heap", freeHeap);
+  Database.set<int>(aClient, basePath + "/Min_Free_Heap", minHeap);
+  Database.set<int>(aClient, basePath + "/Sketch_Size", sketchSize);
+  Database.set<int>(aClient, basePath + "/Free_Sketch_Space", freeSketchSpace);
+  Database.set<int>(aClient, basePath + "/FIRMWARE_VERSION", FIRMWARE_VERSION);
+  Database.set<String>(aClient, basePath + "/Build_Date", buildDate);
+  Database.set<String>(aClient, basePath + "/Uptime_Start", String(millis() / 1000) + " sec");
+
+  Serial.println("📤 Uploaded full ESP info to Firebase:");
+  Serial.printf("Heap: %d bytes | MinHeap: %d bytes | RSSI: %d dBm\n", freeHeap, minHeap, rssi);
+}
+
+
+
+
 // ===================================================
 // ========== WiFiManager Setup Function =============
 // ===================================================
@@ -188,8 +278,15 @@ void openPortalAndSaveCredentials() {
   Serial.println("✅ Portal finished. Wi-Fi connected!");
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
+  
 }
 
+
+
+// Function to get ESP32 reset reason as readable string
+esp_reset_reason_t getResetReason() {
+  return esp_reset_reason();
+}
 // ===================================================
 // ========== WiFi connection + load =================
 // ===================================================
@@ -271,15 +368,28 @@ void firebase_setup()
   Serial.println("✅ Authenticated Successfully!");
 
   // ===== Clear previous nodes =====
+
+    // ===== Check Reset Reason =====
+  esp_reset_reason_t reason = getResetReason();
+  Serial.print("ESP Reset Reason: ");
+  Serial.println((int)reason);
+
+  // Only reset SWITCH_STATE if Power-On or External Reset
+  if (reason == ESP_RST_POWERON || reason == ESP_RST_EXT) {
+    Serial.println("🔁 Power-on or External Reset detected. Resetting SWITCH_STATE...");
+    Database.remove(aClient, "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE");
+    Serial.println("SWITCH_STATE reset ✅");
+  } else {
+    Serial.println("No SWITCH_STATE reset required.");
+  }
   Database.remove(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS");
-  Database.remove(aClient, "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE");
   Serial.println("Old nodes cleared ✅");
 
   // ===== Start streaming BUTTONS path =====
   Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
   streamClient.setSSEFilters("put,patch,keep-alive");
   Database.get(streamClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS", processData, true, "streamTask");
-
+  uploadESPInfo();
   Serial.println("📡 Firebase stream started...");
 }
 
@@ -304,25 +414,17 @@ void processData(AsyncResult &aResult)
         int swValue = data.toInt();
         String swName = path.substring(1); // remove '/'
 
-        if (swValue == 1)
-        {
-          Serial.printf("%s_ON\n", swName.c_str());
-          String statePath = "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE/" + swName;
-          Database.set<int>(aClient, statePath, 1);
+        if (swValue == 1 || swValue == 0) {
+          int switchNo = path.substring(3).toInt(); // extract number from /SWx
+          printSystemEvent(sys_id, switchNo, swValue);  // print twice in format
+
           Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
-        }
-        else if(swValue == 0)
-        {
-          Serial.printf("%s_OFF\n", swName.c_str());
-          String statePath = "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE/" + swName;
-          Database.set<int>(aClient, statePath, 0);
-          Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
-        }
-      
-        
+
+          // reset path after action
           String resetpath = "/SYSTEM/" + String(sys_id) + "/BUTTONS/" + swName;
           Database.set<int>(aClient, resetpath, 3);
-        //delay(1000);
+        }
+
       }
       else if (path.startsWith("/ONLINE"))
       {
@@ -330,7 +432,16 @@ void processData(AsyncResult &aResult)
       }
       else if (path.startsWith("/SET_TIME"))
       {
-       readSchedulesFromFirebase();
+       int Value = data.toInt();
+       if(Value == 1)
+       {
+        readschedules_flag = 1;
+       }
+       else
+       {
+        readschedules_flag = 0;
+       }
+       Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/SET_TIME", 0);
       }
       else if (path.startsWith("/UPDATE"))
       {
@@ -338,23 +449,27 @@ void processData(AsyncResult &aResult)
           if (Value == 1)
           {
               // Reset the UPDATE flag immediately
-              Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/UPDATE", 0);
+            Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/UPDATE", 0);
 
-              // Read the OTA URL from Firebase
-              String otaURL = Database.get<String>(aClient, "/ADDITIONAL_INFO/UPDATE_LINK32");
-              Serial.println("📡 OTA URL fetched: " + otaURL);
-              
-             // Serial.println("📡 OTA URL fetched: " + otaURL);
+            // Read the OTA URL from Firebase
+            otaURL = Database.get<String>(aClient, "/ADDITIONAL_INFO/UPDATE_LINK32");
+            Serial.println("📡 OTA URL fetched: " + otaURL);
+            
+            // Serial.println("📡 OTA URL fetched: " + otaURL);
 
-              // Save last update time
-              String updatetime = String(time_hours) + ":" + String(time_mint) + " " +
-                                  String(currentDay) + "/" + String(currentMonth) + "/" + String(currentYear);
-              Database.set<String>(aClient, "/SYSTEM/" + String(sys_id) + "/LAST_UPDATE_TIME", updatetime);
-
-              // Perform OTA
-              perform_update(otaURL);
-              
+            // Save last update time
+            String updatetime = String(time_hours) + ":" + String(time_mint) + " " +
+                                String(currentDay) + "/" + String(currentMonth) + "/" + String(currentYear);
+            Database.set<String>(aClient, "/SYSTEM/" + String(sys_id) + "/LAST_UPDATE_TIME", updatetime);
+            perform_ota_flag = 1;
+            // Perform OTA
+            //perform_update(otaURL);
+            
              
+          }
+          else
+          {
+            perform_ota_flag = 0;
           }
       }
     }
@@ -374,6 +489,37 @@ void set_time() {
 }
 // 1–25 (ignore index 0)
 
+void checkCachedSchedule() {
+    // Update time only once here or call set_time() outside
+    for (int i = 1; i <= MAX_SWITCH_NO; i++) {
+        if (!schedules[i].valid) continue;
+
+        // ----- ON Trigger -----
+        if (time_hours == schedules[i].onHour && time_mint == schedules[i].onMin) {
+            if (!triggeredState[i][1]) {   // not triggered yet
+                printSystemEvent(sys_id, i, 1);
+                triggeredState[i][1] = true;   // mark as triggered
+                triggeredState[i][0] = false;  // reset opposite
+            }
+        }
+        // ----- OFF Trigger -----
+        else if (time_hours == schedules[i].offHour && time_mint == schedules[i].offMin) {
+            if (!triggeredState[i][0]) {
+                printSystemEvent(sys_id, i, 0);
+                triggeredState[i][0] = true;
+                triggeredState[i][1] = false;
+            }
+        }
+        // ----- If minute moved on, reset -----
+        else if (time_mint != lastTriggeredMinute || time_hours != lastTriggeredHour) {
+            triggeredState[i][0] = false;
+            triggeredState[i][1] = false;
+        }
+    }
+
+    lastTriggeredHour = time_hours;
+    lastTriggeredMinute = time_mint;
+}
 void readSchedulesFromFirebase() {
     if (!app.isAuthenticated()) {
         Serial.println("❌ Firebase not authenticated. Skipping schedule load.");
@@ -440,21 +586,7 @@ void readSchedulesFromFirebase() {
         Serial.println(result.error().message());
     }
 }
-void checkCachedSchedule() {
-    // Print current time for debugging
-    
 
-    for (int i = 1; i <= MAX_SWITCH_NO; i++) {
-        if (schedules[i].valid) {
-            if (time_hours == schedules[i].onHour && time_mint == schedules[i].onMin) {
-                Serial.printf("⏰ SW%d ON (Triggered from cache)\n", i);
-            }
-            if (time_hours == schedules[i].offHour && time_mint == schedules[i].offMin) {
-                Serial.printf("⏰ SW%d OFF (Triggered from cache)\n", i);
-            }
-        }
-    }
-}
 void printAllSchedules() {
   Serial.printf("⏱ Current Time: %02d:%02d\n", time_hours, time_mint);
     Serial.println(F("📋 All Switch Schedules:"));
@@ -471,12 +603,24 @@ void printAllSchedules() {
         }
     }
 }
+void printSystemEvent(const char* sysId, int switchNo, int state) {
+  String statePath = "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE/SW" + String(switchNo);
+  Database.set<int>(aClient, statePath, state);
+  String NOTIPath = "/SYSTEM/" + String(sys_id) + "/NOTIFICATION/SW" + String(switchNo);
+  Database.set<int>(aClient, NOTIPath, state);
+  char buffer[50];
+  snprintf(buffer, sizeof(buffer), "%s_%02d_%d", sysId, switchNo, state);
+  Serial.println();
+  Serial.println(buffer);
+  delay(1000);
+  Serial.println(buffer);  // print twice
 
-void perform_update(String url) {
+}
+void perform_update() {
   WiFiClientSecure client;
   client.setInsecure();  // Accept all certificates (unsafe but works for ESP32 OTA)
-
-  t_httpUpdate_return ret = httpUpdate.update(client, url);
+  Serial.println("Updating...");
+  t_httpUpdate_return ret = httpUpdate.update(client, otaURL);
 
   switch (ret) {
     case HTTP_UPDATE_FAILED:
@@ -491,7 +635,74 @@ void perform_update(String url) {
       break;
   }
 }
+void check_reconnect() {
+  unsigned long now = millis();
 
+  // --- Wi-Fi Check every 5 seconds ---
+  if (now - lastWiFiCheck > 5000) {
+    lastWiFiCheck = now;
+
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiWasConnected) {
+        wifiWasConnected = false;
+        wifiDisconnectedSince = now;
+        Serial.println("⚠️ Wi-Fi lost, starting reconnect attempts...");
+      }
+
+      // Try reconnecting for up to 1 minute
+      if (now - wifiDisconnectedSince < 60000) {
+        WiFi.reconnect();
+      }
+      // Restart if Wi-Fi down for 3 minutes
+      else if (now - wifiDisconnectedSince > 180000) {
+        Serial.println("❌ Wi-Fi not reconnected for 3 minutes → Restarting...");
+        delay(1000);
+        ESP.restart();
+      }
+    } else {
+      if (!wifiWasConnected) {
+        Serial.println("✅ Wi-Fi reconnected.");
+        wifiWasConnected = true;
+        wifiDisconnectedSince = 0;
+      }
+    }
+  }
+
+  // --- Firebase Auth Check every 10 seconds ---
+  if (wifiWasConnected) {
+    if (!app.isAuthenticated()) {
+      if (firebaseWasAuth) {
+        firebaseWasAuth = false;
+        firebaseAuthFailSince = now;
+        Serial.println("⚠️ Firebase auth lost, trying to reauthenticate...");
+      }
+
+      // Try reauth for 1 min
+      if (now - firebaseAuthFailSince < 60000) {
+        app.loop();
+        // if it succeeds:
+        if (app.isAuthenticated()) {
+          firebaseWasAuth = true;
+          firebaseAuthFailSince = 0;
+          Serial.println("✅ Firebase re-authenticated.");
+        }
+      } else {
+        Serial.println("❌ Firebase auth failed for 1 minute → Restarting...");
+        delay(1000);
+       // ESP.restart();
+      }
+    } else {
+      firebaseWasAuth = true;
+      firebaseAuthFailSince = 0;
+    }
+  }
+}
+void firebaseTask(void *parameter) {
+  for (;;) {
+    app.loop();        // keep Firebase alive
+    vTaskDelay(pdMS_TO_TICKS(10));   // every 100ms
+  }
+}
 // ===================================================
 // ========== MAIN SETUP & LOOP ======================
 // ===================================================
@@ -514,14 +725,16 @@ void setup()
      firebase_setup();  
      readSchedulesFromFirebase();
   } // may open WiFiManager portal if needed
-               // initialize Firebase after credentials are loaded
+  xTaskCreatePinnedToCore(firebaseTask, "FirebaseTask", 8192, NULL, 2, NULL, 1);
+  
 }
 
 void loop()
 {
-  app.loop();
+ // app.loop();
   set_time(); // Maintain Firebase connection
   checkCachedSchedule();
+  check_reconnect();
   //printAllSchedules();
   //delay(1000);
   if (digitalRead(TRIGGER_PIN) == 0)
@@ -537,4 +750,15 @@ void loop()
       ESP.restart();
     }
   }
+  if(perform_ota_flag == 1)
+  {
+    perform_ota_flag = 0;
+    perform_update();
+  }
+  if(readschedules_flag == 1)
+  {
+    readschedules_flag = 0;
+    readSchedulesFromFirebase();
+  }
+
 }

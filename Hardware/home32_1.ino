@@ -48,7 +48,8 @@ struct Schedule {
   int onHour, onMin, offHour, offMin;
 };
 
-Schedule schedules[MAX_SWITCH_NO + 1]; 
+Schedule schedules[MAX_SWITCH_NO + 1];
+ HardwareSerial UART2(2);  // Using UART2
 // ========== Global Variables ==========
 char sys_id[SYSID_LEN + 1] = "DEFAULT_SYS";
 char user_email[EMAIL_LEN + 1] = "";
@@ -69,7 +70,7 @@ bool firebaseWasAuth = true;
 // Prevent duplicate prints for same time
 int lastTriggeredHour = -1;
 int lastTriggeredMinute = -1;
-bool triggeredState[MAX_SWITCH_NO + 1][2];  
+bool triggeredState[MAX_SWITCH_NO + 1][2],buttonPressed = false;  
 // [i][0] for OFF, [i][1] for ON
 
 SSL_CLIENT ssl_client, stream_ssl_client;
@@ -86,7 +87,10 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
 
 
 void processData(AsyncResult &aResult);
-
+void IRAM_ATTR handleButtonPress() 
+{
+  buttonPressed = true;
+}
 
 
 // ----------------- EEPROM helpers -----------------
@@ -238,6 +242,14 @@ void uploadESPInfo()
 // ========== WiFiManager Setup Function =============
 // ===================================================
 void openPortalAndSaveCredentials() {
+  for(int i = 0;i<=5;i++)
+  {
+    digitalWrite(wifiLed,HIGH);
+    delay(500);
+    digitalWrite(wifiLed,LOW);
+    delay(500);
+
+  }
   WiFiManager wm;
 
   // Load existing credentials from EEPROM to pre-populate portal fields (if present)
@@ -278,7 +290,14 @@ void openPortalAndSaveCredentials() {
   Serial.println("✅ Portal finished. Wi-Fi connected!");
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
-  
+  for(int i = 0;i<=5;i++)
+  {
+    digitalWrite(wifiLed,HIGH);
+    delay(500);
+    digitalWrite(wifiLed,LOW);
+    delay(500);
+  }
+  ESP.restart();
 }
 
 
@@ -321,6 +340,7 @@ bool connectWiFiAndLoadCredentials() {
     return true;
   } else {
     Serial.println("❌ Wi-Fi not connected in 10 sec (Skipping WiFiManager Auto Portal)");
+    openPortalAndSaveCredentials();
     return false;
   }
 }
@@ -555,6 +575,7 @@ void readSchedulesFromFirebase() {
         json.setJsonData(jsonStr);
         FirebaseJsonData data;
 
+        // ✅ LOOP THROUGH SW1...SWn
         for (int i = 1; i <= MAX_SWITCH_NO; i++) {
             String sw_key = "SW" + String(i);
 
@@ -564,28 +585,38 @@ void readSchedulesFromFirebase() {
                 FirebaseJson swObj;
                 swObj.setJsonData(data.to<String>());
 
-                swObj.get(data, "ON_HR");
-                if (data.success) schedules[i].onHour = data.to<int>();
+                swObj.get(data, "ON_HOUR");
+                if (data.success) schedules[i].onHour = data.to<String>().toInt();
 
                 swObj.get(data, "ON_MIN");
-                if (data.success) schedules[i].onMin = data.to<int>();
+                if (data.success) schedules[i].onMin = data.to<String>().toInt();
 
-                swObj.get(data, "OFF_HR");
-                if (data.success) schedules[i].offHour = data.to<int>();
+                swObj.get(data, "OFF_HOUR");
+                if (data.success) schedules[i].offHour = data.to<String>().toInt();
 
                 swObj.get(data, "OFF_MIN");
-                if (data.success) schedules[i].offMin = data.to<int>();
+                if (data.success) schedules[i].offMin = data.to<String>().toInt();
+
+
+                // ✅ DEBUG CONFIRMATION PER SWITCH
+                Serial.printf("✅ SW%d Stored -> ON %02d:%02d | OFF %02d:%02d\n",
+                              i, schedules[i].onHour, schedules[i].onMin,
+                              schedules[i].offHour, schedules[i].offMin);
             } else {
                 schedules[i].valid = false;
             }
         }
 
-        Serial.println("✅ Schedules loaded and cached.");
+        Serial.println("✅ All schedules loaded & stored in RAM.");
     } else {
         Serial.print("❌ Firebase Error: ");
         Serial.println(result.error().message());
     }
+
+    // ✅ Final overall debug print
+    //printAllSchedules();
 }
+
 
 void printAllSchedules() {
   Serial.printf("⏱ Current Time: %02d:%02d\n", time_hours, time_mint);
@@ -604,16 +635,18 @@ void printAllSchedules() {
     }
 }
 void printSystemEvent(const char* sysId, int switchNo, int state) {
+  digitalWrite(TRANSFER_IND_PIN,LOW);
   String statePath = "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE/SW" + String(switchNo);
   Database.set<int>(aClient, statePath, state);
   String NOTIPath = "/SYSTEM/" + String(sys_id) + "/NOTIFICATION/SW" + String(switchNo);
   Database.set<int>(aClient, NOTIPath, state);
   char buffer[50];
   snprintf(buffer, sizeof(buffer), "%s_%02d_%d", sysId, switchNo, state);
-  Serial.println();
-  Serial.println(buffer);
+  UART2.println();
+  UART2.println(buffer);
   delay(1000);
-  Serial.println(buffer);  // print twice
+  UART2.println(buffer);  // print twice
+  digitalWrite(TRANSFER_IND_PIN,HIGH);
 
 }
 void perform_update() {
@@ -646,6 +679,8 @@ void check_reconnect() {
       if (wifiWasConnected) {
         wifiWasConnected = false;
         wifiDisconnectedSince = now;
+        firebaseWasAuth = false;
+
         Serial.println("⚠️ Wi-Fi lost, starting reconnect attempts...");
       }
 
@@ -709,8 +744,14 @@ void firebaseTask(void *parameter) {
 void setup()
 {
   Serial.begin(115200);
+  UART2.begin(9600, SERIAL_8N1, 16, 17); // RX=16, TX=17 (you can change)
+
   delay(100);
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
+  pinMode(wifiLed, OUTPUT);
+  pinMode(TRANSFER_IND_PIN, OUTPUT);
+  digitalWrite(TRANSFER_IND_PIN,HIGH);
+  digitalWrite(wifiLed,LOW);
 
   // Initialize EEPROM early
   if (!EEPROM.begin(EEPROM_SIZE)) {
@@ -726,19 +767,37 @@ void setup()
      readSchedulesFromFirebase();
   } // may open WiFiManager portal if needed
   xTaskCreatePinnedToCore(firebaseTask, "FirebaseTask", 8192, NULL, 2, NULL, 1);
-  
+  attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), handleButtonPress, FALLING);
 }
 
 void loop()
 {
  // app.loop();
-  set_time(); // Maintain Firebase connection
-  checkCachedSchedule();
-  check_reconnect();
-  //printAllSchedules();
-  //delay(1000);
-  if (digitalRead(TRIGGER_PIN) == 0)
+  if (wifiWasConnected) 
   {
+    if (firebaseWasAuth) 
+    {
+      digitalWrite(wifiLed,HIGH);
+
+      set_time(); // Maintain Firebase connection
+      checkCachedSchedule();
+    }
+    else
+    {
+      digitalWrite(wifiLed,LOW);
+    }
+  }
+  else
+  {
+    digitalWrite(wifiLed,LOW);
+  }
+
+  check_reconnect();
+ // printAllSchedules();
+ // delay(1000);
+  if (digitalRead(TRIGGER_PIN) == 0 || buttonPressed)
+  {
+    buttonPressed = false;
     delay(500); // debouce & long-press style
     if (digitalRead(TRIGGER_PIN) == 0)
     {
@@ -747,7 +806,7 @@ void loop()
       // After portal, re-init firebase with new credentials (simple approach: restart)
       Serial.println("Restarting to apply new credentials...");
       delay(500);
-      ESP.restart();
+      
     }
   }
   if(perform_ota_flag == 1)

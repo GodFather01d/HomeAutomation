@@ -3,7 +3,7 @@
 #define ENABLE_USER_AUTH
 #define ENABLE_DATABASE
 
-#define FIRMWARE_VERSION 3.0
+#define FIRMWARE_VERSION 4.5
 
 #include <WiFiManager.h>    
 #include <FirebaseClient.h>
@@ -27,7 +27,8 @@
 #define wifiLed 2           // D4: WiFi status LED
 #define TRIGGER_PIN 13      // D5: Pin to trigger WiFiManager AP mode
 #define TRANSFER_IND_PIN 12 // D6: Data transfer indication LED
-
+#define TX2 16               //TX pin for uart 
+#define RX2 17              //RX pin fo uart 
 
 // ========== EEPROM Layout (bytes) ==========
 #define EEPROM_SIZE        200
@@ -441,8 +442,8 @@ void processData(AsyncResult &aResult)
           Database.set<int>(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS", 1);
 
           // reset path after action
-          String resetpath = "/SYSTEM/" + String(sys_id) + "/BUTTONS/" + swName;
-          Database.set<int>(aClient, resetpath, 3);
+          // String resetpath = "/SYSTEM/" + String(sys_id) + "/BUTTONS/"+ swName;
+          // Database.update(aClient, resetpath,3);
         }
 
       }
@@ -473,17 +474,17 @@ void processData(AsyncResult &aResult)
 
             // Read the OTA URL from Firebase
             otaURL = Database.get<String>(aClient, "/ADDITIONAL_INFO/UPDATE_LINK32");
-            Serial.println("📡 OTA URL fetched: " + otaURL);
+           // Serial.println("📡 OTA URL fetched: " + otaURL);
             
-            // Serial.println("📡 OTA URL fetched: " + otaURL);
+            Serial.println("📡 OTA URL fetched: " + otaURL);
 
             // Save last update time
             String updatetime = String(time_hours) + ":" + String(time_mint) + " " +
                                 String(currentDay) + "/" + String(currentMonth) + "/" + String(currentYear);
             Database.set<String>(aClient, "/SYSTEM/" + String(sys_id) + "/LAST_UPDATE_TIME", updatetime);
-            perform_ota_flag = 1;
+            //perform_ota_flag = 1;
             // Perform OTA
-            //perform_update(otaURL);
+            perform_update();
             
              
           }
@@ -510,7 +511,8 @@ void set_time() {
 // 1–25 (ignore index 0)
 
 void checkCachedSchedule() {
-    // Update time only once here or call set_time() outside
+    // Update time only once here or call set_time() outside ]
+
     for (int i = 1; i <= MAX_SWITCH_NO; i++) {
         if (!schedules[i].valid) continue;
 
@@ -636,6 +638,8 @@ void printAllSchedules() {
 }
 void printSystemEvent(const char* sysId, int switchNo, int state) {
   digitalWrite(TRANSFER_IND_PIN,LOW);
+  Database.remove(aClient, "/SYSTEM/" + String(sys_id) + "/BUTTONS");
+
   String statePath = "/SYSTEM/" + String(sys_id) + "/SWITCH_STATE/SW" + String(switchNo);
   Database.set<int>(aClient, statePath, state);
   String NOTIPath = "/SYSTEM/" + String(sys_id) + "/NOTIFICATION/SW" + String(switchNo);
@@ -647,6 +651,8 @@ void printSystemEvent(const char* sysId, int switchNo, int state) {
   delay(1000);
   UART2.println(buffer);  // print twice
   digitalWrite(TRANSFER_IND_PIN,HIGH);
+  String ONLINE_PATH = "/SYSTEM/" + String(sys_id) + "/BUTTONS/ONLINE_STATUS";
+  Database.set<int>(aClient, ONLINE_PATH, 1);
 
 }
 void perform_update() {
@@ -744,7 +750,7 @@ void firebaseTask(void *parameter) {
 void setup()
 {
   Serial.begin(115200);
-  UART2.begin(9600, SERIAL_8N1, 16, 17); // RX=16, TX=17 (you can change)
+  UART2.begin(9600, SERIAL_8N1, RX2, RX2); // RX=16, TX=17 (you can change)
 
   delay(100);
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
